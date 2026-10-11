@@ -10,7 +10,8 @@ openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime, time, timedelta, timezone
+from datetime import date as date_type, datetime, time, timedelta, timezone
+from pymongo import ASCENDING, DESCENDING, MongoClient
 from typing import Literal, Optional
 
 from dotenv import load_dotenv
@@ -31,6 +32,14 @@ def ensure_indexes():
         [("emp_code", ASCENDING), ("date", ASCENDING)],
         unique=True,
         name="uniq_emp_date",
+    )
+    db.attendance_logs.create_index(
+        [("date", DESCENDING), ("emp_code", ASCENDING)],
+        name="date_desc_emp",
+    )
+    db.attendance_logs.create_index(
+        [("status", ASCENDING), ("date", DESCENDING), ("emp_code", ASCENDING)],
+        name="status_date_emp",
     )
 
 
@@ -73,6 +82,36 @@ def attendance_day_and_late(punch_utc: datetime, shift_start: str, shift_end: st
     late_minutes = int(late_seconds // 60) if late_seconds > 600 else 0
     return day.isoformat(), late_minutes
 
+def convert_value(v):
+    return utc_to_millis(v) if isinstance(v, datetime) else v
+
+
+def history_to_api(h: dict) -> dict:
+    return {
+        "at": utc_to_millis(h["at"]),
+        "by": h["by"],
+        "reason": h["reason"],
+        "changes": {
+            k: {"from": convert_value(c["from"]), "to": convert_value(c["to"])}
+            for k, c in h["changes"].items()
+        },
+    }
+
+
+def attendance_to_api(d: dict) -> dict:
+    return {
+        "emp_code": d["emp_code"],
+        "date": d["date"],
+        "status": d["status"],
+        "punch_in": convert_value(d.get("punch_in")),
+        "punch_out": convert_value(d.get("punch_out")),
+        "work_hours": d.get("work_hours"),
+        "late_minutes": d.get("late_minutes", 0),
+        "overtime_minutes": d.get("overtime_minutes", 0),
+        "half_day": d.get("half_day", False),
+        "history": [history_to_api(h) for h in d.get("history", [])],
+    }
+
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
     return round((punch_out - punch_in).total_seconds() / 3600, 2)
@@ -96,6 +135,7 @@ class EmployeeIn(BaseModel):
     shift_end: str = "18:30"
     joined_on: str
 
+AnyStatus = Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]
 
 class PunchInIn(BaseModel):
     emp_code: str
@@ -188,30 +228,40 @@ def punch_in(body: PunchInIn):
 @app.get("/attendance")
 def list_attendance(
     emp_code: Optional[str] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    status: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 20,
+    date_from: Optional[date_type] = None,
+    date_to: Optional[date_type] = None,
+    status: Optional[AnyStatus] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
 ):
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(422, "date_from must not be after date_to")
+
     q = {}
-    if emp_code:
+    if emp_code is not None:
         q["emp_code"] = emp_code
     if date_from or date_to:
         q["date"] = {}
         if date_from:
-            q["date"]["$gte"] = date_from
+            q["date"]["$gte"] = date_from.isoformat()
         if date_to:
-            q["date"]["$lte"] = date_to
-    if status:
+            q["date"]["$lte"] = date_to.isoformat()
+    if status is not None:
         q["status"] = status
-    docs = list(db.attendance_logs.find(q))
-    docs.sort(key=lambda d: d["date"], reverse=True)
-    total = len(docs)
-    page_docs = docs[(page - 1) * page_size : page * page_size]
-    for d in page_docs:
-        d["id"] = str(d.pop("_id"))
-    return {"items": page_docs, "total": total, "page": page, "page_size": page_size}
+
+    total = db.attendance_logs.count_documents(q)
+    cursor = (
+        db.attendance_logs.find(q, {"_id": 0})
+        .sort([("date", DESCENDING), ("emp_code", ASCENDING)])
+        .skip((page - 1) * page_size)
+        .limit(page_size)
+    )
+    return {
+        "items": [attendance_to_api(d) for d in cursor],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
 
 
 # --------------------------------------------------------------------------- #
