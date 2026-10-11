@@ -164,6 +164,14 @@ class PunchOutIn(BaseModel):
     punched_at: Optional[EpochMs] = None
 
 
+class RegularizeIn(BaseModel):
+    status: Optional[AnyStatus] = None
+    punch_in: Optional[EpochMs] = None
+    punch_out: Optional[EpochMs] = None
+    reason: str = Field(min_length=5, max_length=200)
+    regularized_by: str = Field(min_length=1, max_length=50)
+
+
 # --------------------------------------------------------------------------- #
 # Endpoints provided
 # --------------------------------------------------------------------------- #
@@ -333,6 +341,99 @@ def punch_out(body: PunchOutIn):
     if updated is None:  # someone else closed it between our read and our write
         raise HTTPException(409, "already punched out")
 
+    return attendance_to_api(updated)
+
+@app.patch("/attendance/{emp_code}/{date}")
+def regularize(emp_code: str, date: date_type, body: RegularizeIn):
+    date_str = date.isoformat()
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    rec = db.attendance_logs.find_one({"emp_code": emp_code, "date": date_str})
+    if rec is None:
+        raise HTTPException(404, "no record for that date")
+
+    old_status = rec["status"]
+    old_in = rec.get("punch_in")
+    old_out = rec.get("punch_out")
+
+    # 1) the final status and punch times
+    new_status = body.status if body.status is not None else old_status
+    if new_status in ("ABSENT", "LEAVE"):
+        if body.punch_in is not None or body.punch_out is not None:
+            raise HTTPException(422, "ABSENT/LEAVE cannot have punch times")
+        new_in, new_out = None, None
+    else:
+        new_in = millis_to_utc(body.punch_in) if body.punch_in is not None else old_in
+        new_out = millis_to_utc(body.punch_out) if body.punch_out is not None else old_out
+        if new_in is None:
+            raise HTTPException(422, "a presence status requires a punch_in")
+
+    if new_status == old_status and new_in == old_in and new_out == old_out:
+        raise HTTPException(422, "request changes nothing")
+
+    # 2) validate and recompute the derived fields (R2-R5)
+    if new_status in ("ABSENT", "LEAVE"):
+        derived = {"late_minutes": 0, "work_hours": None, "overtime_minutes": 0, "half_day": False}
+    else:
+        att_date, late = attendance_day_and_late(new_in, emp["shift_start"], emp["shift_end"])
+        if body.punch_in is not None and att_date != date_str:
+            raise HTTPException(422, "punch_in must stay on the record's attendance date")
+        if new_out is None:
+            derived = {"late_minutes": late, "work_hours": None, "overtime_minutes": 0, "half_day": False}
+        else:
+            if new_out <= new_in or new_out - new_in > timedelta(hours=24):
+                raise HTTPException(422, "punch_out must be after punch_in and within 24 hours")
+            hours = compute_work_hours(new_in, new_out)
+            derived = {
+                "late_minutes": late,
+                "work_hours": hours,
+                "overtime_minutes": compute_overtime(new_out, emp["shift_start"], emp["shift_end"], date_str),
+                "half_day": hours < 4.5,
+            }
+
+    # 3) only the fields that actually changed go into history
+    new_doc = {"status": new_status, "punch_in": new_in, "punch_out": new_out, **derived}
+    old_doc = {
+        "status": old_status,
+        "punch_in": old_in,
+        "punch_out": old_out,
+        "work_hours": rec.get("work_hours"),
+        "late_minutes": rec.get("late_minutes", 0),
+        "overtime_minutes": rec.get("overtime_minutes", 0),
+        "half_day": rec.get("half_day", False),
+    }
+    changes = {
+        k: {"from": old_doc[k], "to": new_doc[k]} for k in new_doc if new_doc[k] != old_doc[k]
+    }
+    entry = {
+        "at": datetime.now(timezone.utc),
+        "by": body.regularized_by,
+        "reason": body.reason,
+        "changes": changes,
+    }
+
+    # 4) write only if the record is exactly as we read it (optimistic locking)
+    cond = {
+        "emp_code": emp_code,
+        "date": date_str,
+        "status": old_status,
+        "punch_in": old_in,
+        "punch_out": old_out,
+    }
+    old_history = rec.get("history") or []
+    if old_history:
+        cond["history"] = {"$size": len(old_history)}
+    else:
+        cond["$or"] = [{"history": {"$exists": False}}, {"history": {"$size": 0}}]
+
+    updated = db.attendance_logs.find_one_and_update(
+        cond,
+        {"$set": new_doc, "$push": {"history": entry}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        raise HTTPException(409, "record was modified concurrently, please retry")
     return attendance_to_api(updated)
 
 
