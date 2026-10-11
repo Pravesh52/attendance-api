@@ -8,3 +8,4 @@ DATA_MODEL.md
 sample_data/
 sample_seed.py
 test_db.py
+race_test.py

@@ -11,8 +11,10 @@ openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 import os
 from contextlib import asynccontextmanager
 from datetime import date as date_type, datetime, time, timedelta, timezone
-from pymongo import ASCENDING, DESCENDING, MongoClient
-from typing import Literal, Optional
+from decimal import ROUND_HALF_UP, Decimal
+from typing import Annotated, Literal, Optional
+
+from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
@@ -22,7 +24,7 @@ from pymongo.errors import DuplicateKeyError
 
 load_dotenv()
 
-client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
+client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"), tz_aware=True)
 db = client[os.getenv("MONGO_DB", "attendance_db")]
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -41,6 +43,11 @@ def ensure_indexes():
         [("status", ASCENDING), ("date", DESCENDING), ("emp_code", ASCENDING)],
         name="status_date_emp",
     )
+    db.attendance_logs.create_index(
+        [("emp_code", ASCENDING), ("punch_in", DESCENDING)],
+        name="emp_punchin_desc",
+    )
+    
 
 
 @asynccontextmanager
@@ -114,13 +121,19 @@ def attendance_to_api(d: dict) -> dict:
 
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
-    return round((punch_out - punch_in).total_seconds() / 3600, 2)
+    seconds = int((punch_out - punch_in).total_seconds())
+    hours = Decimal(seconds) / Decimal(3600)
+    return float(hours.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
-def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
-    h, m = map(int, shift_end.split(":"))
-    end = datetime.fromisoformat(date_str).replace(hour=h, minute=m, tzinfo=IST)
-    return max(0, int((punch_out - end).total_seconds() / 60))
+def compute_overtime(punch_out: datetime, shift_start: str, shift_end: str, date_str: str) -> int:
+    start_t, end_t = parse_hhmm(shift_start), parse_hhmm(shift_end)
+    end_day = date_type.fromisoformat(date_str)
+    if end_t <= start_t:  # overnight shift: it ends on the next calendar day
+        end_day += timedelta(days=1)
+    shift_end_dt = datetime.combine(end_day, end_t, tzinfo=IST)
+    minutes = int((punch_out - shift_end_dt).total_seconds() // 60)
+    return minutes if minutes >= 30 else 0
 
 
 # --------------------------------------------------------------------------- #
@@ -137,10 +150,18 @@ class EmployeeIn(BaseModel):
 
 AnyStatus = Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]
 
+EpochMs = Annotated[StrictInt, Field(ge=100000000000, le=4102444800000)]
+
+
 class PunchInIn(BaseModel):
     emp_code: str
-    punched_at: Optional[StrictInt] = Field(default=None, ge=100000000000, le=4102444800000)
+    punched_at: Optional[EpochMs] = None
     status: Literal["PRESENT", "WFH", "ON_DUTY"] = "PRESENT"
+
+
+class PunchOutIn(BaseModel):
+    emp_code: str
+    punched_at: Optional[EpochMs] = None
 
 
 # --------------------------------------------------------------------------- #
@@ -262,6 +283,57 @@ def list_attendance(
         "page": page,
         "page_size": page_size,
     }
+
+@app.post("/attendance/punch-out")
+def punch_out(body: PunchOutIn):
+    emp = db.employees.find_one({"emp_code": body.emp_code})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+
+    if body.punched_at is not None:
+        ts = millis_to_utc(body.punched_at)
+    else:
+        ts = datetime.now(timezone.utc).replace(microsecond=0)
+
+    # most recent record whose punch_in is at or before punched_at
+    # (null punch_in, i.e. ABSENT/LEAVE, never matches $lte)
+    rec = db.attendance_logs.find_one(
+        {"emp_code": body.emp_code, "punch_in": {"$lte": ts}},
+        sort=[("punch_in", DESCENDING)],
+    )
+    if rec is None:
+        raise HTTPException(404, "no punch-in found")
+    if rec.get("punch_out") is not None:
+        raise HTTPException(409, "already punched out")
+
+    punch_in_ts = rec["punch_in"]
+    if ts <= punch_in_ts or ts - punch_in_ts > timedelta(hours=24):
+        raise HTTPException(422, "punched_at must be after punch_in and within 24 hours of it")
+
+    work_hours = compute_work_hours(punch_in_ts, ts)
+    overtime = compute_overtime(ts, emp["shift_start"], emp["shift_end"], rec["date"])
+
+    updated = db.attendance_logs.find_one_and_update(
+        {
+            "emp_code": body.emp_code,
+            "date": rec["date"],
+            "punch_in": punch_in_ts,
+            "punch_out": None,  # matches null or missing: only an open record
+        },
+        {
+            "$set": {
+                "punch_out": ts,
+                "work_hours": work_hours,
+                "overtime_minutes": overtime,
+                "half_day": work_hours < 4.5,
+            }
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:  # someone else closed it between our read and our write
+        raise HTTPException(409, "already punched out")
+
+    return attendance_to_api(updated)
 
 
 # --------------------------------------------------------------------------- #
