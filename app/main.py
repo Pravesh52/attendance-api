@@ -9,13 +9,15 @@ works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expec
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
-from datetime import datetime, timedelta, timezone
-from typing import Optional
+from contextlib import asynccontextmanager
+from datetime import datetime, time, timedelta, timezone
+from typing import Literal, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel
-from pymongo import MongoClient
+from pydantic import BaseModel, Field, StrictInt
+from pymongo import ASCENDING, MongoClient
+from pymongo.errors import DuplicateKeyError
 
 load_dotenv()
 
@@ -24,17 +26,52 @@ db = client[os.getenv("MONGO_DB", "attendance_db")]
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
-app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
+def ensure_indexes():
+    db.attendance_logs.create_index(
+        [("emp_code", ASCENDING), ("date", ASCENDING)],
+        unique=True,
+        name="uniq_emp_date",
+    )
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    ensure_indexes()
+    yield
+
+
+app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", lifespan=lifespan)
 
 
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
-def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
-    h, m = map(int, shift_start.split(":"))
-    start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0)
-    minutes = int((punch_in - start).total_seconds() / 60)
-    return minutes if minutes > 10 else 0
+def parse_hhmm(value: str) -> time:
+    h, m = map(int, value.split(":"))
+    return time(h, m)
+
+
+def millis_to_utc(ms: int) -> datetime:
+    return datetime.fromtimestamp(ms // 1000, tz=timezone.utc)  # // truncates to whole seconds
+
+
+def utc_to_millis(dt: datetime) -> int:
+    if dt.tzinfo is None:  # PyMongo returns naive datetimes that are really UTC
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp()) * 1000
+
+
+def attendance_day_and_late(punch_utc: datetime, shift_start: str, shift_end: str):
+    """R1 + R2. Returns (attendance date 'YYYY-MM-DD', late_minutes)."""
+    start_t, end_t = parse_hhmm(shift_start), parse_hhmm(shift_end)
+    punch_ist = punch_utc.astimezone(IST)
+    day = punch_ist.date()
+    if end_t <= start_t and punch_ist.time() < end_t:  # overnight shift, belongs to previous day
+        day = day - timedelta(days=1)
+    shift_start_dt = datetime.combine(day, start_t, tzinfo=IST)
+    late_seconds = (punch_ist - shift_start_dt).total_seconds()
+    late_minutes = int(late_seconds // 60) if late_seconds > 600 else 0
+    return day.isoformat(), late_minutes
 
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
@@ -62,8 +99,8 @@ class EmployeeIn(BaseModel):
 
 class PunchInIn(BaseModel):
     emp_code: str
-    punched_at: Optional[int] = None
-    status: str = "PRESENT"
+    punched_at: Optional[StrictInt] = Field(default=None, ge=100000000000, le=4102444800000)
+    status: Literal["PRESENT", "WFH", "ON_DUTY"] = "PRESENT"
 
 
 # --------------------------------------------------------------------------- #
@@ -108,26 +145,44 @@ def list_employees(
 @app.post("/attendance/punch-in", status_code=201)
 def punch_in(body: PunchInIn):
     emp = db.employees.find_one({"emp_code": body.emp_code})
-    ts = datetime.fromtimestamp(body.punched_at / 1000) if body.punched_at else datetime.now()
-    d = ts.date().isoformat()
-    if db.attendance_logs.find_one({"emp_code": body.emp_code, "date": d}):
-        raise HTTPException(409, "already punched in for this date")
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+
+    if body.punched_at is not None:
+        ts = millis_to_utc(body.punched_at)
+    else:
+        ts = datetime.now(timezone.utc).replace(microsecond=0)
+
+    date_str, late = attendance_day_and_late(ts, emp["shift_start"], emp["shift_end"])
     doc = {
         "emp_code": body.emp_code,
-        "date": d,
+        "date": date_str,
         "status": body.status,
         "punch_in": ts,
         "punch_out": None,
         "work_hours": None,
-        "late_minutes": compute_late_minutes(ts, emp["shift_start"]),
+        "late_minutes": late,
         "overtime_minutes": 0,
         "half_day": False,
         "history": [],
     }
-    res = db.attendance_logs.insert_one(doc)
-    doc["id"] = str(res.inserted_id)
-    doc.pop("_id", None)
-    return doc
+    try:
+        db.attendance_logs.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(409, "already punched in for this date")
+
+    return {
+        "emp_code": body.emp_code,
+        "date": date_str,
+        "status": body.status,
+        "punch_in": utc_to_millis(ts),
+        "punch_out": None,
+        "work_hours": None,
+        "late_minutes": late,
+        "overtime_minutes": 0,
+        "half_day": False,
+        "history": [],
+    }
 
 
 @app.get("/attendance")
