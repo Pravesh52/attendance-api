@@ -1,0 +1,10 @@
+venv/
+.env
+__pycache__/
+*.pyc
+PROBLEM_STATEMENT.docx
+openapi.yaml
+DATA_MODEL.md
+sample_data/
+sample_seed.py
+test_db.py
