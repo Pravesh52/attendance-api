@@ -273,6 +273,7 @@ def department_summary(
     month: str = Query(..., pattern=MONTH_PATTERN),
     department: Optional[str] = None,
 ):
+
     first, last = month_bounds(month)
     emp_filter = {"joined_on": {"$lte": last.isoformat()}}
     if department is not None:
@@ -338,6 +339,56 @@ def department_summary(
         )
     return {"month": month, "items": items}
 
+@app.get("/analytics/leaderboard/late")
+def late_leaderboard(
+    month: str = Query(..., pattern=MONTH_PATTERN),
+    limit: int = Query(10, ge=1, le=50),
+    department: Optional[str] = None,
+):
+    first, last = month_bounds(month)
+    pipeline = [
+        {"$match": {"date": {"$gte": first.isoformat(), "$lte": last.isoformat()}}},
+        {
+            "$group": {
+                "_id": "$emp_code",
+                "total_late_minutes": {"$sum": {"$ifNull": ["$late_minutes", 0]}},
+                "late_count": {"$sum": {"$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]}},
+            }
+        },
+        {"$match": {"total_late_minutes": {"$gt": 0}}},
+        {"$lookup": {"from": "employees", "localField": "_id", "foreignField": "emp_code", "as": "emp"}},
+        {"$unwind": "$emp"},  # no preserve: logs of unknown employees are dropped
+    ]
+    if department is not None:
+        pipeline.append({"$match": {"emp.department": department}})  # rank inside the department only
+    pipeline += [
+        {"$setWindowFields": {"sortBy": {"total_late_minutes": -1}, "output": {"rank": {"$rank": {}}}}},
+        {"$match": {"rank": {"$lte": limit}}},
+        {"$sort": {"total_late_minutes": -1, "_id": 1}},
+        {
+            "$project": {
+                "_id": 0,
+                "rank": 1,
+                "emp_code": "$_id",
+                "name": "$emp.name",
+                "department": "$emp.department",
+                "total_late_minutes": 1,
+                "late_count": 1,
+            }
+        },
+    ]
+    items = [
+        {
+            "rank": int(r["rank"]),
+            "emp_code": r["emp_code"],
+            "name": r["name"],
+            "department": r["department"],
+            "total_late_minutes": int(r["total_late_minutes"]),
+            "late_count": int(r["late_count"]),
+        }
+        for r in db.attendance_logs.aggregate(pipeline)
+    ]
+    return {"month": month, "items": items}
 
 # --------------------------------------------------------------------------- #
 # Endpoints provided
