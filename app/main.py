@@ -9,6 +9,7 @@ works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expec
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
+import calendar
 from contextlib import asynccontextmanager
 from datetime import date as date_type, datetime, time, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
@@ -119,6 +120,24 @@ def attendance_to_api(d: dict) -> dict:
         "history": [history_to_api(h) for h in d.get("history", [])],
     }
 
+PRESENT_STATUSES = ["PRESENT", "WFH", "ON_DUTY"]
+MONTH_PATTERN = r"^\d{4}-(0[1-9]|1[0-2])$"
+
+
+def month_bounds(month: str):
+    year, mon = int(month[:4]), int(month[5:7])
+    if year < 1:
+        raise HTTPException(422, "invalid month")
+    last_day = calendar.monthrange(year, mon)[1]
+    return date_type(year, mon, 1), date_type(year, mon, last_day)
+
+
+def count_weekdays(start: date_type, end: date_type) -> int:
+    if end < start:
+        return 0
+    days = (end - start).days + 1
+    return sum(1 for i in range(days) if (start + timedelta(days=i)).weekday() < 5)
+
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
     seconds = int((punch_out - punch_in).total_seconds())
@@ -170,6 +189,64 @@ class RegularizeIn(BaseModel):
     punch_out: Optional[EpochMs] = None
     reason: str = Field(min_length=5, max_length=200)
     regularized_by: str = Field(min_length=1, max_length=50)
+
+
+@app.get("/analytics/employees/{emp_code}/monthly")
+def employee_monthly(emp_code: str, month: str = Query(..., pattern=MONTH_PATTERN)):
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+
+    first, last = month_bounds(month)
+    start = max(first, date_type.fromisoformat(emp["joined_on"]))
+    working_days = count_weekdays(start, last)
+
+    pipeline = [
+        {"$match": {"emp_code": emp_code, "date": {"$gte": f"{month}-01", "$lte": f"{month}-31"}}},
+        {
+            "$group": {
+                "_id": None,
+                "present_days": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$and": [
+                                    {"$in": ["$status", PRESENT_STATUSES]},
+                                    {"$lte": [{"$isoDayOfWeek": {"$dateFromString": {"dateString": "$date"}}}, 5]},
+                                ]
+                            },
+                            {"$cond": [{"$eq": [{"$ifNull": ["$half_day", False]}, True]}, 0.5, 1]},
+                            0,
+                        ]
+                    }
+                },
+                "leave_days": {"$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}},
+                "late_count": {"$sum": {"$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]}},
+                "total_late_minutes": {"$sum": {"$ifNull": ["$late_minutes", 0]}},
+                "total_overtime_minutes": {"$sum": {"$ifNull": ["$overtime_minutes", 0]}},
+            }
+        },
+    ]
+    rows = list(db.attendance_logs.aggregate(pipeline))
+    r = rows[0] if rows else {}
+
+    present_days = float(r.get("present_days", 0))
+    attendance_pct = None
+    if working_days > 0:
+        pct = Decimal(str(present_days)) / Decimal(working_days) * 100
+        attendance_pct = float(pct.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+    return {
+        "emp_code": emp_code,
+        "month": month,
+        "working_days": working_days,
+        "present_days": present_days,
+        "leave_days": int(r.get("leave_days", 0)),
+        "late_count": int(r.get("late_count", 0)),
+        "total_late_minutes": int(r.get("total_late_minutes", 0)),
+        "total_overtime_minutes": int(r.get("total_overtime_minutes", 0)),
+        "attendance_pct": attendance_pct,
+    }
 
 
 # --------------------------------------------------------------------------- #
