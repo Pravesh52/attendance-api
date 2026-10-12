@@ -10,6 +10,8 @@ openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
 import calendar
+import json
+from bson import json_util
 from contextlib import asynccontextmanager
 from datetime import date as date_type, datetime, time, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
@@ -53,6 +55,7 @@ def ensure_indexes():
         [("department", ASCENDING), ("joined_on", ASCENDING)],
         name="dept_joined",
     )
+    db.employees.create_index("joined_on", name="joined_on")
     
 
 
@@ -208,6 +211,21 @@ class RegularizeIn(BaseModel):
     regularized_by: str = Field(min_length=1, max_length=50)
 
 
+def build_monthly_pipeline(emp_code: str, month: str) -> list:
+    return [
+        {"$match": {"emp_code": emp_code, "date": {"$gte": f"{month}-01", "$lte": f"{month}-31"}}},
+        {
+            "$group": {
+                "_id": None,
+                "present_days": {"$sum": present_value_expr()},
+                "leave_days": {"$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}},
+                "late_count": {"$sum": {"$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]}},
+                "total_late_minutes": {"$sum": {"$ifNull": ["$late_minutes", 0]}},
+                "total_overtime_minutes": {"$sum": {"$ifNull": ["$overtime_minutes", 0]}},
+            }
+        },
+    ]
+
 @app.get("/analytics/employees/{emp_code}/monthly")
 def employee_monthly(emp_code: str, month: str = Query(..., pattern=MONTH_PATTERN)):
     emp = db.employees.find_one({"emp_code": emp_code})
@@ -218,32 +236,7 @@ def employee_monthly(emp_code: str, month: str = Query(..., pattern=MONTH_PATTER
     start = max(first, date_type.fromisoformat(emp["joined_on"]))
     working_days = count_weekdays(start, last)
 
-    pipeline = [
-        {"$match": {"emp_code": emp_code, "date": {"$gte": f"{month}-01", "$lte": f"{month}-31"}}},
-        {
-            "$group": {
-                "_id": None,
-                "present_days": {
-                    "$sum": {
-                        "$cond": [
-                            {
-                                "$and": [
-                                    {"$in": ["$status", PRESENT_STATUSES]},
-                                    {"$lte": [{"$isoDayOfWeek": {"$dateFromString": {"dateString": "$date"}}}, 5]},
-                                ]
-                            },
-                            {"$cond": [{"$eq": [{"$ifNull": ["$half_day", False]}, True]}, 0.5, 1]},
-                            0,
-                        ]
-                    }
-                },
-                "leave_days": {"$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}},
-                "late_count": {"$sum": {"$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]}},
-                "total_late_minutes": {"$sum": {"$ifNull": ["$late_minutes", 0]}},
-                "total_overtime_minutes": {"$sum": {"$ifNull": ["$overtime_minutes", 0]}},
-            }
-        },
-    ]
+    pipeline = build_monthly_pipeline(emp_code, month)
     rows = list(db.attendance_logs.aggregate(pipeline))
     r = rows[0] if rows else {}
 
@@ -266,19 +259,14 @@ def employee_monthly(emp_code: str, month: str = Query(..., pattern=MONTH_PATTER
     }
 
 
-@app.get("/analytics/departments/summary")
-def department_summary(
-    month: str = Query(..., pattern=MONTH_PATTERN),
-    department: Optional[str] = None,
-):
-
+def build_summary_pipeline(month: str, department: Optional[str]) -> list:
     first, last = month_bounds(month)
     emp_filter = {"joined_on": {"$lte": last.isoformat()}}
     if department is not None:
         emp_filter["department"] = department
 
     has_wh = {"$and": [{"$in": ["$logs.status", PRESENT_STATUSES]}, {"$isNumber": "$logs.work_hours"}]}
-    pipeline = [
+    return [
         {"$match": emp_filter},
         {
             "$lookup": {
@@ -317,6 +305,14 @@ def department_summary(
         {"$sort": {"_id": 1}},
     ]
 
+
+@app.get("/analytics/departments/summary")
+def department_summary(
+    month: str = Query(..., pattern=MONTH_PATTERN),
+    department: Optional[str] = None,
+):
+    pipeline = build_summary_pipeline(month, department)
+
     items = []
     for r in db.employees.aggregate(pipeline):
         avg = None
@@ -337,12 +333,8 @@ def department_summary(
         )
     return {"month": month, "items": items}
 
-@app.get("/analytics/leaderboard/late")
-def late_leaderboard(
-    month: str = Query(..., pattern=MONTH_PATTERN),
-    limit: int = Query(10, ge=1, le=50),
-    department: Optional[str] = None,
-):
+
+def build_leaderboard_pipeline(month: str, limit: int, department: Optional[str]) -> list:
     first, last = month_bounds(month)
     pipeline = [
         {"$match": {"date": {"$gte": first.isoformat(), "$lte": last.isoformat()}}},
@@ -375,6 +367,16 @@ def late_leaderboard(
             }
         },
     ]
+    return pipeline
+
+
+@app.get("/analytics/leaderboard/late")
+def late_leaderboard(
+    month: str = Query(..., pattern=MONTH_PATTERN),
+    limit: int = Query(10, ge=1, le=50),
+    department: Optional[str] = None,
+):
+    pipeline = build_leaderboard_pipeline(month, limit, department)
     items = [
         {
             "rank": int(r["rank"]),
@@ -388,12 +390,9 @@ def late_leaderboard(
     ]
     return {"month": month, "items": items}
 
-@app.get("/analytics/departments/{department}/trend")
-def department_trend(
-    department: str,
-    from_: date_type = Query(..., alias="from"),
-    to: date_type = Query(...),
-):
+
+
+def build_trend_pipeline(department: str, from_: date_type, to: date_type) -> list:
     if to < from_:
         raise HTTPException(422, "to must not be before from")
     if (to - from_).days + 1 > 92:
@@ -408,7 +407,7 @@ def department_trend(
     start_dt = datetime(from_.year, from_.month, from_.day, tzinfo=timezone.utc)
     end_dt = datetime(to.year, to.month, to.day, tzinfo=timezone.utc)
 
-    pipeline = [
+    return [
         {"$match": {"emp_code": {"$in": codes}, "date": {"$gte": from_.isoformat(), "$lte": to.isoformat()}}},
         {
             "$group": {
@@ -486,6 +485,15 @@ def department_trend(
             }
         },
     ]
+
+
+@app.get("/analytics/departments/{department}/trend")
+def department_trend(
+    department: str,
+    from_: date_type = Query(..., alias="from"),
+    to: date_type = Query(...),
+):
+    pipeline = build_trend_pipeline(department, from_, to)
 
     items = []
     for r in db.attendance_logs.aggregate(pipeline):
@@ -590,6 +598,22 @@ def punch_in(body: PunchInIn):
         "history": [],
     }
 
+ATTENDANCE_SORT = [("date", DESCENDING), ("emp_code", ASCENDING)]
+
+
+def build_attendance_query(emp_code, date_from, date_to, status) -> dict:
+    q = {}
+    if emp_code is not None:
+        q["emp_code"] = emp_code
+    if date_from or date_to:
+        q["date"] = {}
+        if date_from:
+            q["date"]["$gte"] = date_from.isoformat()
+        if date_to:
+            q["date"]["$lte"] = date_to.isoformat()
+    if status is not None:
+        q["status"] = status
+    return q
 
 @app.get("/attendance")
 def list_attendance(
@@ -602,23 +626,12 @@ def list_attendance(
 ):
     if date_from and date_to and date_from > date_to:
         raise HTTPException(422, "date_from must not be after date_to")
-
-    q = {}
-    if emp_code is not None:
-        q["emp_code"] = emp_code
-    if date_from or date_to:
-        q["date"] = {}
-        if date_from:
-            q["date"]["$gte"] = date_from.isoformat()
-        if date_to:
-            q["date"]["$lte"] = date_to.isoformat()
-    if status is not None:
-        q["status"] = status
+    q = build_attendance_query(emp_code, date_from, date_to, status)
 
     total = db.attendance_logs.count_documents(q)
     cursor = (
         db.attendance_logs.find(q, {"_id": 0})
-        .sort([("date", DESCENDING), ("emp_code", ASCENDING)])
+       .sort(ATTENDANCE_SORT)
         .skip((page - 1) * page_size)
         .limit(page_size)
     )
@@ -774,6 +787,56 @@ def regularize(emp_code: str, date: date_type, body: RegularizeIn):
     return attendance_to_api(updated)
 
 
+@app.get("/admin/explain/{endpoint}")
+def explain_endpoint(
+    endpoint: Literal["attendance_list", "employee_monthly", "department_summary", "late_leaderboard", "department_trend"],
+    emp_code: Optional[str] = None,
+    month: Optional[str] = Query(None, pattern=MONTH_PATTERN),
+    department: Optional[str] = None,
+    limit: int = Query(10, ge=1, le=50),
+    date_from: Optional[date_type] = None,
+    date_to: Optional[date_type] = None,
+    status: Optional[AnyStatus] = None,
+    from_: Optional[date_type] = Query(None, alias="from"),
+    to: Optional[date_type] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    def need(**params):
+        missing = [k for k, v in params.items() if v is None]
+        if missing:
+            raise HTTPException(422, "missing parameters: " + ", ".join(missing))
+
+    if endpoint == "attendance_list":
+        if date_from and date_to and date_from > date_to:
+            raise HTTPException(422, "date_from must not be after date_to")
+        collection = "attendance_logs"
+        cmd = {
+            "find": collection,
+            "filter": build_attendance_query(emp_code, date_from, date_to, status),
+            "sort": dict(ATTENDANCE_SORT),
+            "projection": {"_id": 0},
+            "skip": (page - 1) * page_size,
+            "limit": page_size,
+        }
+    else:
+        if endpoint == "employee_monthly":
+            need(emp_code=emp_code, month=month)
+            collection, pipeline = "attendance_logs", build_monthly_pipeline(emp_code, month)
+        elif endpoint == "department_summary":
+            need(month=month)
+            collection, pipeline = "employees", build_summary_pipeline(month, department)
+        elif endpoint == "late_leaderboard":
+            need(month=month)
+            collection, pipeline = "attendance_logs", build_leaderboard_pipeline(month, limit, department)
+        else:  # department_trend
+            need(department=department, **{"from": from_, "to": to})
+            collection, pipeline = "attendance_logs", build_trend_pipeline(department, from_, to)
+        cmd = {"aggregate": collection, "pipeline": pipeline, "cursor": {}}
+
+    result = db.command({"explain": cmd, "verbosity": "executionStats"})
+    # explain output holds BSON types (dates, Int64...), so convert it to plain JSON
+    return {"endpoint": endpoint, "collection": collection, "explain": json.loads(json_util.dumps(result))}
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
 #   POST  /attendance/punch-out
