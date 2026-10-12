@@ -48,6 +48,11 @@ def ensure_indexes():
         [("emp_code", ASCENDING), ("punch_in", DESCENDING)],
         name="emp_punchin_desc",
     )
+    db.employees.create_index("emp_code", unique=True, name="uniq_emp_code")
+    db.employees.create_index(
+        [("department", ASCENDING), ("joined_on", ASCENDING)],
+        name="dept_joined",
+    )
     
 
 
@@ -138,6 +143,20 @@ def count_weekdays(start: date_type, end: date_type) -> int:
     days = (end - start).days + 1
     return sum(1 for i in range(days) if (start + timedelta(days=i)).weekday() < 5)
 
+def present_value_expr(p: str = "$"):
+    """Aggregation expression: 1 / 0.5 / 0 present-day value of a log, Mon-Fri only (R5-R7)."""
+    return {
+        "$cond": [
+            {
+                "$and": [
+                    {"$in": [f"{p}status", PRESENT_STATUSES]},
+                    {"$lte": [{"$isoDayOfWeek": {"$dateFromString": {"dateString": f"{p}date"}}}, 5]},
+                ]
+            },
+            {"$cond": [{"$eq": [{"$ifNull": [f"{p}half_day", False]}, True]}, 0.5, 1]},
+            0,
+        ]
+    }
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
     seconds = int((punch_out - punch_in).total_seconds())
@@ -247,6 +266,77 @@ def employee_monthly(emp_code: str, month: str = Query(..., pattern=MONTH_PATTER
         "total_overtime_minutes": int(r.get("total_overtime_minutes", 0)),
         "attendance_pct": attendance_pct,
     }
+
+
+@app.get("/analytics/departments/summary")
+def department_summary(
+    month: str = Query(..., pattern=MONTH_PATTERN),
+    department: Optional[str] = None,
+):
+    first, last = month_bounds(month)
+    emp_filter = {"joined_on": {"$lte": last.isoformat()}}
+    if department is not None:
+        emp_filter["department"] = department
+
+    has_wh = {"$and": [{"$in": ["$logs.status", PRESENT_STATUSES]}, {"$isNumber": "$logs.work_hours"}]}
+    pipeline = [
+        {"$match": emp_filter},
+        {
+            "$lookup": {
+                "from": "attendance_logs",
+                "let": {"code": "$emp_code"},
+                "pipeline": [
+                    {
+                        "$match": {
+                            "$expr": {
+                                "$and": [
+                                    {"$eq": ["$emp_code", "$$code"]},
+                                    {"$gte": ["$date", first.isoformat()]},
+                                    {"$lte": ["$date", last.isoformat()]},
+                                ]
+                            }
+                        }
+                    }
+                ],
+                "as": "logs",
+            }
+        },
+        {"$unwind": {"path": "$logs", "preserveNullAndEmptyArrays": True}},
+        {
+            "$group": {
+                "_id": "$department",
+                "emps": {"$addToSet": "$emp_code"},
+                "present_days": {"$sum": present_value_expr("$logs.")},
+                "wh_sum": {"$sum": {"$cond": [has_wh, "$logs.work_hours", 0]}},
+                "wh_count": {"$sum": {"$cond": [has_wh, 1, 0]}},
+                "late_count": {"$sum": {"$cond": [{"$gt": [{"$ifNull": ["$logs.late_minutes", 0]}, 0]}, 1, 0]}},
+                "total_late_minutes": {"$sum": {"$ifNull": ["$logs.late_minutes", 0]}},
+                "leave_count": {"$sum": {"$cond": [{"$eq": ["$logs.status", "LEAVE"]}, 1, 0]}},
+                "on_duty_count": {"$sum": {"$cond": [{"$eq": ["$logs.status", "ON_DUTY"]}, 1, 0]}},
+            }
+        },
+        {"$sort": {"_id": 1}},
+    ]
+
+    items = []
+    for r in db.employees.aggregate(pipeline):
+        avg = None
+        if r["wh_count"] > 0:
+            mean = Decimal(str(round(r["wh_sum"], 2))) / Decimal(r["wh_count"])
+            avg = float(mean.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+        items.append(
+            {
+                "department": r["_id"],
+                "headcount": len(r["emps"]),
+                "present_days": float(r["present_days"]),
+                "avg_work_hours": avg,
+                "late_count": int(r["late_count"]),
+                "total_late_minutes": int(r["total_late_minutes"]),
+                "leave_count": int(r["leave_count"]),
+                "on_duty_count": int(r["on_duty_count"]),
+            }
+        )
+    return {"month": month, "items": items}
 
 
 # --------------------------------------------------------------------------- #
