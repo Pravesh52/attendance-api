@@ -143,16 +143,14 @@ def count_weekdays(start: date_type, end: date_type) -> int:
     days = (end - start).days + 1
     return sum(1 for i in range(days) if (start + timedelta(days=i)).weekday() < 5)
 
-def present_value_expr(p: str = "$"):
-    """Aggregation expression: 1 / 0.5 / 0 present-day value of a log, Mon-Fri only (R5-R7)."""
+def present_value_expr(p: str = "$", weekdays_only: bool = True):
+    """Aggregation expression: 1 / 0.5 / 0 present-day value of a log (R5, R6, and R7 if weekdays_only)."""
+    conds = [{"$in": [f"{p}status", PRESENT_STATUSES]}]
+    if weekdays_only:
+        conds.append({"$lte": [{"$isoDayOfWeek": {"$dateFromString": {"dateString": f"{p}date"}}}, 5]})
     return {
         "$cond": [
-            {
-                "$and": [
-                    {"$in": [f"{p}status", PRESENT_STATUSES]},
-                    {"$lte": [{"$isoDayOfWeek": {"$dateFromString": {"dateString": f"{p}date"}}}, 5]},
-                ]
-            },
+            {"$and": conds},
             {"$cond": [{"$eq": [{"$ifNull": [f"{p}half_day", False]}, True]}, 0.5, 1]},
             0,
         ]
@@ -389,6 +387,127 @@ def late_leaderboard(
         for r in db.attendance_logs.aggregate(pipeline)
     ]
     return {"month": month, "items": items}
+
+@app.get("/analytics/departments/{department}/trend")
+def department_trend(
+    department: str,
+    from_: date_type = Query(..., alias="from"),
+    to: date_type = Query(...),
+):
+    if to < from_:
+        raise HTTPException(422, "to must not be before from")
+    if (to - from_).days + 1 > 92:
+        raise HTTPException(422, "range must not exceed 92 days")
+
+    emps = list(db.employees.find({"department": department}, {"_id": 0, "emp_code": 1, "joined_on": 1}))
+    if not emps:
+        raise HTTPException(404, "unknown department")
+    codes = [e["emp_code"] for e in emps]
+    joined = [e["joined_on"] for e in emps]
+
+    start_dt = datetime(from_.year, from_.month, from_.day, tzinfo=timezone.utc)
+    end_dt = datetime(to.year, to.month, to.day, tzinfo=timezone.utc)
+
+    pipeline = [
+        {"$match": {"emp_code": {"$in": codes}, "date": {"$gte": from_.isoformat(), "$lte": to.isoformat()}}},
+        {
+            "$group": {
+                "_id": "$date",
+                "present_count": {"$sum": present_value_expr("$", weekdays_only=False)},
+                "late_count": {"$sum": {"$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]}},
+            }
+        },
+        {"$addFields": {"d": {"$dateFromString": {"dateString": "$_id"}}}},
+        {"$densify": {"field": "d", "range": {"step": 1, "unit": "day", "bounds": [start_dt, end_dt + timedelta(days=1)]}}},
+        {"$match": {"d": {"$gte": start_dt, "$lte": end_dt}}},  # keeps exactly from..to, whatever the bound semantics
+        {
+            "$addFields": {
+                "date": {"$dateToString": {"format": "%Y-%m-%d", "date": "$d"}},
+                "is_working_day": {"$lte": [{"$isoDayOfWeek": "$d"}, 5]},
+                "present_count": {"$ifNull": ["$present_count", 0]},
+                "late_count": {"$ifNull": ["$late_count", 0]},
+            }
+        },
+        {
+            "$addFields": {
+                "headcount": {
+                    "$size": {
+                        "$filter": {
+                            "input": {"$literal": joined},
+                            "as": "j",
+                            "cond": {"$lte": ["$$j", "$date"]},
+                        }
+                    }
+                }
+            }
+        },
+        {
+            # attendance_rate in units of 1/10000, rounded half-up with exact integer maths:
+            # floor(rate*10000 + 0.5) = floor((10000*N + H) / (2*H)), where N = 2*present_count
+            "$addFields": {
+                "rate_int": {
+                    "$cond": [
+                        {"$and": ["$is_working_day", {"$gt": ["$headcount", 0]}]},
+                        {
+                            "$floor": {
+                                "$divide": [
+                                    {"$add": [{"$multiply": [{"$multiply": ["$present_count", 2]}, 10000]}, "$headcount"]},
+                                    {"$multiply": [2, "$headcount"]},
+                                ]
+                            }
+                        },
+                        None,
+                    ]
+                }
+            }
+        },
+        {"$addFields": {"has_rate": {"$cond": [{"$eq": ["$rate_int", None]}, 0, 1]}}},
+        {
+            "$setWindowFields": {
+                "sortBy": {"d": 1},
+                "output": {
+                    "win_sum": {"$sum": "$rate_int", "window": {"documents": [-6, 0]}},
+                    "win_n": {"$sum": "$has_rate", "window": {"documents": [-6, 0]}},
+                },
+            }
+        },
+        {"$sort": {"d": 1}},
+        {
+            "$project": {
+                "_id": 0,
+                "date": 1,
+                "is_working_day": 1,
+                "headcount": 1,
+                "present_count": 1,
+                "late_count": 1,
+                "rate_int": 1,
+                "win_sum": 1,
+                "win_n": 1,
+            }
+        },
+    ]
+
+    items = []
+    for r in db.attendance_logs.aggregate(pipeline):
+        rate = None
+        if r.get("rate_int") is not None:
+            rate = float(Decimal(int(r["rate_int"])) / Decimal(10000))
+        moving = None
+        if r["win_n"] > 0:
+            avg = Decimal(int(r["win_sum"])) / Decimal(int(r["win_n"])) / Decimal(10000)
+            moving = float(avg.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP))
+        items.append(
+            {
+                "date": r["date"],
+                "is_working_day": bool(r["is_working_day"]),
+                "headcount": int(r["headcount"]),
+                "present_count": float(r["present_count"]),
+                "late_count": int(r["late_count"]),
+                "attendance_rate": rate,
+                "moving_avg_7d": moving,
+            }
+        )
+    return {"department": department, "items": items}
 
 # --------------------------------------------------------------------------- #
 # Endpoints provided
