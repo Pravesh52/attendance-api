@@ -49,3 +49,10 @@ progresses.
 - `department` filter: the exact, case-sensitive match is what the contract
   asks for.
 
+  ## Looked at and decided it is fine
+
+- `IST = timezone(timedelta(hours=5, minutes=30))`: India has no daylight saving, so a fixed offset is enough.
+- The `{"_id": 0}` projection in the starter's `list_employees` was correct, because `_id` must never appear in the API.
+- The `department` filter as an exact, case-sensitive match is what the contract asks for.
+- Returning 409 when a punch-in already exists was the right status. Only the way it was detected (check, then insert) was racy.
+
