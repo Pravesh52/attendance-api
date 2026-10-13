@@ -9,5 +9,6 @@ sample_data/
 sample_seed.py
 test_db.py
 race_test.py
-check_explain.py
 race_employee.py
+check_explain.py
+smoke_test.py
