@@ -21,13 +21,17 @@ from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, Field, StrictInt
+from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
 from pymongo import ASCENDING, MongoClient
 from pymongo.errors import DuplicateKeyError
 
 load_dotenv()
 
-client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"), tz_aware=True)
+MONGO_URI = os.getenv("MONGO_URI")
+if not MONGO_URI:
+    print("WARNING: MONGO_URI is not set, falling back to mongodb://localhost:27017")
+    MONGO_URI = "mongodb://localhost:27017"
+client = MongoClient(MONGO_URI, tz_aware=True, serverSelectionTimeoutMS=10000)
 db = client[os.getenv("MONGO_DB", "attendance_db")]
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -178,14 +182,29 @@ def compute_overtime(punch_out: datetime, shift_start: str, shift_end: str, date
 # --------------------------------------------------------------------------- #
 # Models
 # --------------------------------------------------------------------------- #
+HHMM_PATTERN = r"^([01][0-9]|2[0-3]):[0-5][0-9]$"
+
+
 class EmployeeIn(BaseModel):
-    emp_code: str
-    name: str
-    email: str
-    department: str
-    shift_start: str = "09:30"
-    shift_end: str = "18:30"
-    joined_on: str
+    emp_code: str = Field(pattern=r"^EMP[0-9]{4,6}$")
+    name: str = Field(min_length=1, max_length=100)
+    email: str = Field(max_length=120, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    department: str = Field(min_length=1, max_length=50)
+    shift_start: str = Field(default="09:30", pattern=HHMM_PATTERN)
+    shift_end: str = Field(default="18:30", pattern=HHMM_PATTERN)
+    joined_on: str = Field(pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+
+    @field_validator("joined_on")
+    @classmethod
+    def joined_on_is_a_real_date(cls, v: str) -> str:
+        date_type.fromisoformat(v)  # ValueError for e.g. 2026-13-45, which becomes a 422
+        return v
+
+    @model_validator(mode="after")
+    def shifts_must_differ(self):
+        if self.shift_start == self.shift_end:
+            raise ValueError("shift_start must differ from shift_end")
+        return self
 
 AnyStatus = Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]
 
@@ -525,15 +544,28 @@ def health():
     return {"status": "ok"}
 
 
+def employee_to_api(e: dict) -> dict:
+    return {
+        "emp_code": e["emp_code"],
+        "name": e["name"],
+        "email": e["email"],
+        "department": e["department"],
+        "shift_start": e["shift_start"],
+        "shift_end": e["shift_end"],
+        "joined_on": e["joined_on"],
+        "created_at": convert_value(e.get("created_at")),
+    }
+
+
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
-    if db.employees.find_one({"emp_code": body.emp_code}):
-        raise HTTPException(409, "emp_code already exists")
     doc = body.model_dump()
-    doc["created_at"] = datetime.now()
-    db.employees.insert_one(doc)
-    doc.pop("_id", None)
-    return doc
+    doc["created_at"] = datetime.now(timezone.utc).replace(microsecond=0)
+    try:
+        db.employees.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(409, "emp_code already exists")
+    return employee_to_api(doc)
 
 
 @app.get("/employees")
@@ -547,14 +579,13 @@ def list_employees(
         q["department"] = department
     skip = (page - 1) * page_size
     total = db.employees.count_documents(q)
-    items = list(
-        db.employees.find(q, {"_id": 0})
-        .sort("emp_code", 1)
-        .skip(skip)
-        .limit(page_size)
-    )
-    return {"items": items, "total": total, "page": page, "page_size": page_size}
-
+    cursor = db.employees.find(q).sort("emp_code", 1).skip(skip).limit(page_size)
+    return {
+        "items": [employee_to_api(e) for e in cursor],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
 
 @app.post("/attendance/punch-in", status_code=201)
 def punch_in(body: PunchInIn):
